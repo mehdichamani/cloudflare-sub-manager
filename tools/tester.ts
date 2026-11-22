@@ -21,6 +21,37 @@ export interface TestResult {
 }
 
 /**
+ * Manage an exclusive pool of local HTTP ports so concurrent tests never conflict
+ */
+export class PortPool {
+  private available: number[] = [];
+  private waiting: ((port: number) => void)[] = [];
+
+  constructor(startPort: number, count: number) {
+    for (let i = 0; i < count; i++) {
+      this.available.push(startPort + i);
+    }
+  }
+
+  acquire(): Promise<number> {
+    const port = this.available.pop();
+    if (port !== undefined) {
+      return Promise.resolve(port);
+    }
+    return new Promise((resolve) => this.waiting.push(resolve));
+  }
+
+  release(port: number): void {
+    const next = this.waiting.shift();
+    if (next) {
+      next(port);
+    } else {
+      this.available.push(port);
+    }
+  }
+}
+
+/**
  * Execute HTTP GET request through an HTTP proxy port with precise timing
  */
 function testHttpViaProxy(
@@ -121,29 +152,33 @@ export function testGeminiViaProxy(
         if (buffer.includes('\r\n\r\n')) {
           const match = buffer.match(/^HTTP\/[0-9.]+\s+(\d+)/);
           const statusCode = match ? parseInt(match[1], 10) : 0;
-          tlsSocket.destroy();
+          try { tlsSocket.destroy(); } catch {}
+          try { socket.destroy(); } catch {}
           // Gemini returns 200 or 302/303 redirect if IP is allowed. Blocked IPs return 403.
           done(statusCode >= 200 && statusCode < 400);
         }
       });
 
       tlsSocket.on('error', () => {
-        tlsSocket.destroy();
+        try { tlsSocket.destroy(); } catch {}
+        try { socket.destroy(); } catch {}
         done(false);
       });
 
       tlsSocket.on('timeout', () => {
-        tlsSocket.destroy();
+        try { tlsSocket.destroy(); } catch {}
+        try { socket.destroy(); } catch {}
         done(false);
       });
     });
 
     connectReq.on('timeout', () => {
-      connectReq.destroy();
+      try { connectReq.destroy(); } catch {}
       done(false);
     });
 
     connectReq.on('error', () => {
+      try { connectReq.destroy(); } catch {}
       done(false);
     });
 
@@ -192,6 +227,34 @@ async function fetchIpInfo(proxyPort: number, timeoutMs: number): Promise<GeoLoc
   return null;
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        resolve(fallback);
+      }
+    }, ms);
+
+    promise
+      .then((val) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(val);
+        }
+      })
+      .catch(() => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(fallback);
+        }
+      });
+  });
+}
+
 /**
  * Test a single node URI with an ephemeral Xray instance
  */
@@ -224,7 +287,21 @@ async function testSingleNode(
     };
   }
 
-  return runOutboundTestWithXray(outbound, nodeUri, originalRemark, protocol, config, assignedPort);
+  // Enforce a hard ceiling timeout for the entire node test
+  const maxSafetyMs = config.timeoutMs + 4000;
+  return withTimeout(
+    runOutboundTestWithXray(outbound, nodeUri, originalRemark, protocol, config, assignedPort),
+    maxSafetyMs,
+    {
+      raw: nodeUri,
+      originalRemark,
+      protocol,
+      alive: false,
+      latencyMs: config.timeoutMs,
+      error: 'Overall node test timeout exceeded',
+      tag: outbound.tag,
+    }
+  );
 }
 
 /**
@@ -306,15 +383,18 @@ async function runOutboundTestWithXray(
       };
     }
 
-    let geo = await fetchIpInfo(assignedPort, Math.min(config.timeoutMs, 3000));
+    let geoPromise = fetchIpInfo(assignedPort, Math.min(config.timeoutMs, 2500));
+    let geminiPromise = testGeminiViaProxy(assignedPort, Math.min(config.timeoutMs, 3000));
+
+    const [geoRes, geminiOk] = await Promise.all([geoPromise, geminiPromise]);
+    let geo = geoRes;
+
     if (!geo || geo.countryCode === 'XX') {
       const deduced = extractGeoFromRemark(originalRemark);
       if (deduced) {
         geo = deduced;
       }
     }
-
-    const geminiOk = await testGeminiViaProxy(assignedPort, Math.min(config.timeoutMs, 4000));
 
     return {
       raw,
@@ -372,6 +452,30 @@ async function testSingleSingboxOutbound(
     };
   }
 
+  const maxSafetyMs = config.timeoutMs + 4000;
+  return withTimeout(
+    runSingleSingboxOutbound(outbound, config, assignedPort, protocol, originalRemark, raw),
+    maxSafetyMs,
+    {
+      raw,
+      originalRemark,
+      protocol,
+      alive: false,
+      latencyMs: config.timeoutMs,
+      error: 'Overall sing-box test timeout exceeded',
+      tag: outbound.tag,
+    }
+  );
+}
+
+async function runSingleSingboxOutbound(
+  outbound: any,
+  config: TesterConfig,
+  assignedPort: number,
+  protocol: string,
+  originalRemark: string,
+  raw: string
+): Promise<TestResult> {
   const sbConfig = {
     log: { level: 'warn' },
     inbounds: [
@@ -413,13 +517,15 @@ async function testSingleSingboxOutbound(
       };
     }
 
-    let geo = await fetchIpInfo(assignedPort, Math.min(config.timeoutMs, 3000));
+    let geoPromise = fetchIpInfo(assignedPort, Math.min(config.timeoutMs, 2500));
+    let geminiPromise = testGeminiViaProxy(assignedPort, Math.min(config.timeoutMs, 3000));
+
+    const [geoRes, geminiOk] = await Promise.all([geoPromise, geminiPromise]);
+    let geo = geoRes;
     if (!geo || geo.countryCode === 'XX') {
       const deduced = extractGeoFromRemark(originalRemark);
       if (deduced) geo = deduced;
     }
-
-    const geminiOk = await testGeminiViaProxy(assignedPort, Math.min(config.timeoutMs, 4000));
 
     return {
       raw,
@@ -460,16 +566,22 @@ export type ProgressCallback = (progress: {
   results: TestResult[];
 }) => void;
 
+export interface TestSignal {
+  aborted: boolean;
+}
+
 /**
  * Run tests concurrently across all nodes (URIs)
  */
 export async function curateNodes(
   nodeUris: string[],
   config: TesterConfig,
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
+  signal?: TestSignal
 ): Promise<TestResult[]> {
   const results: TestResult[] = [];
-  const basePort = 19100 + Math.floor(Math.random() * 500);
+  const startPort = 19100 + Math.floor(Math.random() * 500);
+  const pool = new PortPool(startPort, config.concurrency);
 
   console.log(`\n🔍 Found ${nodeUris.length} nodes to test.`);
   console.log(`⚡ Concurrency: ${config.concurrency} | Timeout: ${config.timeoutMs}ms`);
@@ -485,20 +597,31 @@ export async function curateNodes(
   let nextIdx = 0;
 
   return new Promise((resolve) => {
-    function dispatch() {
+    async function dispatch() {
+      if (signal?.aborted) {
+        if (activeWorkers === 0) {
+          resolve(results);
+        }
+        return;
+      }
+
       if (nextIdx >= nodeUris.length && activeWorkers === 0) {
         resolve(results);
         return;
       }
 
-      while (activeWorkers < config.concurrency && nextIdx < nodeUris.length) {
+      while (!signal?.aborted && activeWorkers < config.concurrency && nextIdx < nodeUris.length) {
         const idx = nextIdx++;
-        const port = basePort + (idx % (config.concurrency * 2));
         const uri = nodeUris[idx];
         activeWorkers++;
 
-        testSingleNode(uri, config, port)
-          .then((res) => {
+        (async () => {
+          const port = await pool.acquire();
+          try {
+            if (signal?.aborted) {
+              return;
+            }
+            const res = await testSingleNode(uri, config, port);
             results.push(res);
             completed++;
             const pct = Math.round((completed / nodeUris.length) * 100);
@@ -520,8 +643,7 @@ export async function curateNodes(
                 results: [...results],
               });
             }
-          })
-          .catch((err) => {
+          } catch (err: any) {
             const failResult: TestResult = {
               raw: uri,
               originalRemark: '',
@@ -541,11 +663,12 @@ export async function curateNodes(
                 results: [...results],
               });
             }
-          })
-          .finally(() => {
+          } finally {
+            pool.release(port);
             activeWorkers--;
             dispatch();
-          });
+          }
+        })();
       }
     }
 
@@ -559,51 +682,84 @@ export async function curateNodes(
 export async function curateXrayJson(
   configObj: any,
   config: TesterConfig,
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
+  signal?: TestSignal
 ): Promise<{ results: TestResult[]; enhancedConfig: any }> {
   const proxyOutbounds = (configObj.outbounds || []).filter((o: any) =>
     ['vless', 'vmess', 'trojan', 'shadowsocks', 'socks'].includes(o.protocol)
   );
 
-  const basePort = 19600 + Math.floor(Math.random() * 300);
+  const startPort = 19600 + Math.floor(Math.random() * 300);
+  const pool = new PortPool(startPort, config.concurrency);
   const results: TestResult[] = [];
   let completed = 0;
+  let activeWorkers = 0;
+  let nextIdx = 0;
 
   console.log(`\n🔍 Found ${proxyOutbounds.length} proxy outbounds in Xray config to test.`);
 
-  for (let i = 0; i < proxyOutbounds.length; i++) {
-    const outbound = proxyOutbounds[i];
-    const port = basePort + (i % 8);
-    const res = await runOutboundTestWithXray(
-      outbound,
-      outbound.tag || `proxy-${i + 1}`,
-      outbound.tag || '',
-      outbound.protocol,
-      config,
-      port
-    );
-    results.push(res);
-    completed++;
-    const pct = Math.round((completed / proxyOutbounds.length) * 100);
-    const statusIcon = res.alive ? '✅' : '❌';
-    const geminiTag = res.geminiOk ? ' 🧠' : '';
-    const info = res.alive
-      ? `${res.geo?.flagEmoji || '⚡'} ${res.latencyMs}ms (${res.geo?.countryCode || 'OK'})${geminiTag}`
-      : 'DEAD';
+  await new Promise<void>((resolve) => {
+    async function dispatch() {
+      if (signal?.aborted) {
+        if (activeWorkers === 0) resolve();
+        return;
+      }
+      if (nextIdx >= proxyOutbounds.length && activeWorkers === 0) {
+        resolve();
+        return;
+      }
 
-    process.stdout.write(
-      `\r[${completed}/${proxyOutbounds.length}] (${pct}%) ${statusIcon} Outbound #${i + 1}: ${info.padEnd(25)}`
-    );
+      while (!signal?.aborted && activeWorkers < config.concurrency && nextIdx < proxyOutbounds.length) {
+        const idx = nextIdx++;
+        const outbound = proxyOutbounds[idx];
+        activeWorkers++;
 
-    if (onProgress) {
-      onProgress({
-        completed,
-        total: proxyOutbounds.length,
-        lastResult: res,
-        results: [...results],
-      });
+        (async () => {
+          const port = await pool.acquire();
+          try {
+            if (signal?.aborted) return;
+            const res = await runOutboundTestWithXray(
+              outbound,
+              outbound.tag || `proxy-${idx + 1}`,
+              outbound.tag || '',
+              outbound.protocol,
+              config,
+              port
+            );
+            results.push(res);
+            completed++;
+            const pct = Math.round((completed / proxyOutbounds.length) * 100);
+            const statusIcon = res.alive ? '✅' : '❌';
+            const geminiTag = res.geminiOk ? ' 🧠' : '';
+            const info = res.alive
+              ? `${res.geo?.flagEmoji || '⚡'} ${res.latencyMs}ms (${res.geo?.countryCode || 'OK'})${geminiTag}`
+              : 'DEAD';
+
+            process.stdout.write(
+              `\r[${completed}/${proxyOutbounds.length}] (${pct}%) ${statusIcon} Outbound #${idx + 1}: ${info.padEnd(25)}`
+            );
+
+            if (onProgress) {
+              onProgress({
+                completed,
+                total: proxyOutbounds.length,
+                lastResult: res,
+                results: [...results],
+              });
+            }
+          } catch (err: any) {
+            completed++;
+          } finally {
+            pool.release(port);
+            activeWorkers--;
+            dispatch();
+          }
+        })();
+      }
     }
-  }
+
+    dispatch();
+  });
 
   // Filter healthy outbounds and sort ascending by latency
   const aliveResults = results
@@ -647,44 +803,77 @@ export async function curateXrayJson(
 export async function curateSingboxJson(
   configObj: any,
   config: TesterConfig,
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
+  signal?: TestSignal
 ): Promise<{ results: TestResult[]; enhancedConfig: any }> {
   const proxyOutbounds = (configObj.outbounds || []).filter((o: any) =>
     ['vless', 'vmess', 'trojan', 'shadowsocks', 'socks', 'hysteria2', 'tuic'].includes(o.type)
   );
 
-  const basePort = 19900 + Math.floor(Math.random() * 300);
+  const startPort = 19900 + Math.floor(Math.random() * 300);
+  const pool = new PortPool(startPort, config.concurrency);
   const results: TestResult[] = [];
   let completed = 0;
+  let activeWorkers = 0;
+  let nextIdx = 0;
 
   console.log(`\n🔍 Found ${proxyOutbounds.length} proxy outbounds in Sing-box config to test.`);
 
-  for (let i = 0; i < proxyOutbounds.length; i++) {
-    const outbound = proxyOutbounds[i];
-    const port = basePort + (i % 8);
-    const res = await testSingleSingboxOutbound(outbound, config, port);
-    results.push(res);
-    completed++;
-    const pct = Math.round((completed / proxyOutbounds.length) * 100);
-    const statusIcon = res.alive ? '✅' : '❌';
-    const geminiTag = res.geminiOk ? ' 🧠' : '';
-    const info = res.alive
-      ? `${res.geo?.flagEmoji || '⚡'} ${res.latencyMs}ms (${res.geo?.countryCode || 'OK'})${geminiTag}`
-      : 'DEAD';
+  await new Promise<void>((resolve) => {
+    async function dispatch() {
+      if (signal?.aborted) {
+        if (activeWorkers === 0) resolve();
+        return;
+      }
+      if (nextIdx >= proxyOutbounds.length && activeWorkers === 0) {
+        resolve();
+        return;
+      }
 
-    process.stdout.write(
-      `\r[${completed}/${proxyOutbounds.length}] (${pct}%) ${statusIcon} Outbound #${i + 1}: ${info.padEnd(25)}`
-    );
+      while (!signal?.aborted && activeWorkers < config.concurrency && nextIdx < proxyOutbounds.length) {
+        const idx = nextIdx++;
+        const outbound = proxyOutbounds[idx];
+        activeWorkers++;
 
-    if (onProgress) {
-      onProgress({
-        completed,
-        total: proxyOutbounds.length,
-        lastResult: res,
-        results: [...results],
-      });
+        (async () => {
+          const port = await pool.acquire();
+          try {
+            if (signal?.aborted) return;
+            const res = await testSingleSingboxOutbound(outbound, config, port);
+            results.push(res);
+            completed++;
+            const pct = Math.round((completed / proxyOutbounds.length) * 100);
+            const statusIcon = res.alive ? '✅' : '❌';
+            const geminiTag = res.geminiOk ? ' 🧠' : '';
+            const info = res.alive
+              ? `${res.geo?.flagEmoji || '⚡'} ${res.latencyMs}ms (${res.geo?.countryCode || 'OK'})${geminiTag}`
+              : 'DEAD';
+
+            process.stdout.write(
+              `\r[${completed}/${proxyOutbounds.length}] (${pct}%) ${statusIcon} Outbound #${idx + 1}: ${info.padEnd(25)}`
+            );
+
+            if (onProgress) {
+              onProgress({
+                completed,
+                total: proxyOutbounds.length,
+                lastResult: res,
+                results: [...results],
+              });
+            }
+          } catch (err: any) {
+            completed++;
+          } finally {
+            pool.release(port);
+            activeWorkers--;
+            dispatch();
+          }
+        })();
+      }
     }
-  }
+
+    dispatch();
+  });
 
   // Filter healthy outbounds and sort ascending by latency
   const aliveResults = results

@@ -37,6 +37,8 @@ let activeTest: ActiveTestState = {
   mode: 'direct',
 };
 
+let currentTestSignal = { aborted: false };
+
 const sseClients: http.ServerResponse[] = [];
 
 function notifyClients(data: any) {
@@ -226,6 +228,7 @@ const server = http.createServer(async (req, res) => {
         if (concurrency) config.concurrency = parseInt(concurrency, 10);
         config.chainProxy = proxyUri;
 
+        currentTestSignal = { aborted: false };
         activeTest = {
           running: true,
           file: targetName,
@@ -242,7 +245,7 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ status: 'started', mode: activeTest.mode }));
 
         // Run async test task in background
-        runBackgroundTest(targetName, targetContent, config, isChain).catch((err) => {
+        runBackgroundTest(targetName, targetContent, config, isChain, currentTestSignal).catch((err) => {
           activeTest.running = false;
           activeTest.error = err.message;
           notifyClients({ type: 'error', error: err.message });
@@ -252,6 +255,15 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: err.message }));
       }
     });
+    return;
+  }
+
+  // API: Stop Active Test
+  if (url.pathname === '/api/test/stop' && req.method === 'POST') {
+    currentTestSignal.aborted = true;
+    activeTest.running = false;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'stopped', resultsCount: activeTest.results.length }));
     return;
   }
 
@@ -403,7 +415,13 @@ function runWranglerCommand(wranglerArgs: string[], res: http.ServerResponse, pr
   });
 }
 
-async function runBackgroundTest(filename: string | undefined, content: string, config: any, isChain: boolean) {
+async function runBackgroundTest(
+  filename: string | undefined,
+  content: string,
+  config: any,
+  isChain: boolean,
+  signal: { aborted: boolean }
+) {
   const isJson = filename?.endsWith('.json') || content.trim().startsWith('{');
   
   const onProgress = (p: any) => {
@@ -430,8 +448,8 @@ async function runBackgroundTest(filename: string | undefined, content: string, 
       notifyClients({ type: 'start', format: 'json', file: filename });
       
       const res = isSingbox
-        ? await curateSingboxJson(parsed, config, onProgress)
-        : await curateXrayJson(parsed, config, onProgress);
+        ? await curateSingboxJson(parsed, config, onProgress, signal)
+        : await curateXrayJson(parsed, config, onProgress, signal);
         
       const { results, enhancedConfig } = res;
       const alive = results.filter((r) => r.alive);
@@ -471,7 +489,7 @@ async function runBackgroundTest(filename: string | undefined, content: string, 
   activeTest.total = lines.length;
   notifyClients({ type: 'start', format: 'txt', total: lines.length, file: filename });
 
-  const results = await curateNodes(lines, config, onProgress);
+  const results = await curateNodes(lines, config, onProgress, signal);
 
   const alive = results.filter((r) => r.alive).sort((a, b) => a.latencyMs - b.latencyMs);
   const dead = results.filter((r) => !r.alive);
@@ -490,7 +508,8 @@ async function runBackgroundTest(filename: string | undefined, content: string, 
     const cityOrCountry = node.geo?.city || node.geo?.countryName || '';
     const loc = cityOrCountry ? ` - ${cityOrCountry}` : '';
     const modeTag = isChain ? ' 🔗' : '';
-    const newRemark = `${flag} ${countryCode}${loc} | ${node.latencyMs}ms${modeTag} #${orderNum}`;
+    const geminiTag = node.geminiOk ? ' 🧠' : '';
+    const newRemark = `${flag} ${countryCode}${loc} | ${node.latencyMs}ms${modeTag} #${orderNum}${geminiTag}`;
     const baseWithoutHash = node.raw.split('#')[0];
     return `${baseWithoutHash}#${encodeURIComponent(newRemark)}`;
   });
@@ -1013,9 +1032,14 @@ function renderTesterGuiHtml(): string {
             </div>
           </div>
 
-          <button id="btnRunTest" class="btn-action" onclick="startTest()">
-            <span>🚀 شروع تست و پاک‌سازی</span>
-          </button>
+          <div style="display:flex; gap:0.5rem;">
+            <button id="btnRunTest" class="btn-action" style="flex:1;" onclick="startTest()">
+              <span>🚀 شروع تست و پاک‌سازی</span>
+            </button>
+            <button id="btnStopTest" class="btn-secondary" style="display:none; background:rgba(239, 68, 68, 0.2); border-color:#ef4444; color:#ef4444;" onclick="stopTest()">
+              <span>⏹ توقف و ثبت نتایج</span>
+            </button>
+          </div>
 
           <div id="saveNotification" class="badge-saved">
             ✔ کانفیگ‌های سالم ذخیره شدند: <span id="savedFileName" style="font-weight:700;"></span>
@@ -1038,6 +1062,10 @@ function renderTesterGuiHtml(): string {
             <div class="stat-card">
               <div class="stat-lbl">ناسالم / سوخته ❌</div>
               <div id="statDead" class="stat-val stat-dead">0</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-lbl">پشتیبانی Gemini 🧠</div>
+              <div id="statGemini" class="stat-val" style="color:#a855f7;">0</div>
             </div>
           </div>
 
@@ -1236,6 +1264,7 @@ function renderTesterGuiHtml(): string {
       const btn = document.getElementById('btnRunTest');
       btn.disabled = true;
       btn.innerHTML = '<span>⏳ در حال تست و ارزیابی نودها...</span>';
+      document.getElementById('btnStopTest').style.display = 'inline-block';
       document.getElementById('saveNotification').style.display = 'none';
 
       try {
@@ -1263,11 +1292,21 @@ function renderTesterGuiHtml(): string {
       }
     }
 
+    async function stopTest() {
+      try {
+        await fetch('/api/test/stop', { method: 'POST' });
+        finishTestUi();
+      } catch (e) {
+        alert('خطا در توقف تست: ' + e.message);
+      }
+    }
+
     function finishTestUi() {
       isTesting = false;
       const btn = document.getElementById('btnRunTest');
       btn.disabled = false;
       btn.innerHTML = '<span>🚀 شروع تست و پاک‌سازی</span>';
+      document.getElementById('btnStopTest').style.display = 'none';
     }
 
     // SSE Connection for live progress
@@ -1293,11 +1332,14 @@ function renderTesterGuiHtml(): string {
           document.getElementById('statTotal').textContent = msg.total || '0';
           document.getElementById('statAlive').textContent = 0;
           document.getElementById('statDead').textContent = 0;
+          document.getElementById('statGemini').textContent = 0;
           document.getElementById('resultsBody').innerHTML = '<tr><td colspan="4" style="text-align:center; color:var(--text-muted); padding: 1.5rem;">در حال آغاز تست کانفیگ‌ها...</td></tr>';
         } else if (msg.type === 'progress') {
           document.getElementById('statTotal').textContent = msg.total;
           document.getElementById('statAlive').textContent = msg.aliveCount;
           document.getElementById('statDead').textContent = msg.deadCount;
+          const gemCount = liveResults.filter(r => r.geminiOk).length;
+          document.getElementById('statGemini').textContent = gemCount;
           
           const btn = document.getElementById('btnRunTest');
           const pct = Math.round((msg.completed / msg.total) * 100);
@@ -1312,8 +1354,8 @@ function renderTesterGuiHtml(): string {
           document.getElementById('statTotal').textContent = msg.total;
           document.getElementById('statAlive').textContent = msg.alive;
           document.getElementById('statDead').textContent = msg.dead;
-
           liveResults = msg.results || liveResults;
+          document.getElementById('statGemini').textContent = liveResults.filter(r => r.geminiOk).length;
           renderTableResults(liveResults);
 
           lastCleanOutput = msg.cleanText || (msg.cleanJson ? JSON.stringify(msg.cleanJson, null, 2) : '');
@@ -1385,7 +1427,8 @@ function renderTesterGuiHtml(): string {
       tbody.innerHTML = sorted.map(r => {
         const flag = r.geo?.flagEmoji || '🌐';
         const geoText = r.geo?.countryCode && r.geo.countryCode !== 'XX' ? \` (\${r.geo.countryCode})\` : '';
-        const name = (r.originalRemark || r.raw.slice(0, 40)) + geoText;
+        const geminiIcon = r.geminiOk ? ' 🧠' : '';
+        const name = (r.originalRemark || r.raw.slice(0, 40)) + geoText + geminiIcon;
         
         let latencyBadge = '';
         if (r.alive) {
@@ -1416,27 +1459,49 @@ function renderTesterGuiHtml(): string {
       return (str || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     }
 
+    function getCleanOutputFromLiveResults() {
+      if (lastCleanOutput) return lastCleanOutput;
+      const alive = liveResults.filter(r => r.alive).sort((a, b) => a.latencyMs - b.latencyMs);
+      if (alive.length === 0) return '';
+      const isChain = currentMode === 'chain';
+      const formatted = alive.map((node, index) => {
+        const orderNum = String(index + 1).padStart(2, '0');
+        const flag = node.geo?.flagEmoji || '🌐';
+        const countryCode = node.geo?.countryCode && node.geo.countryCode !== 'XX' ? node.geo.countryCode : 'Proxy';
+        const cityOrCountry = node.geo?.city || node.geo?.countryName || '';
+        const loc = cityOrCountry ? (' - ' + cityOrCountry) : '';
+        const modeTag = isChain ? ' 🔗' : '';
+        const geminiTag = node.geminiOk ? ' 🧠' : '';
+        const newRemark = flag + ' ' + countryCode + loc + ' | ' + node.latencyMs + 'ms' + modeTag + ' #' + orderNum + geminiTag;
+        const baseWithoutHash = node.raw.split('#')[0];
+        return baseWithoutHash + '#' + encodeURIComponent(newRemark);
+      });
+      return formatted.join('\\n') + '\\n';
+    }
+
     async function saveToOriginalFile() {
-      if (!lastCleanOutput) {
-        alert('ابتدا تست را اجرا نمایید تا کانفیگ‌های سالم مشخص شوند.');
+      const output = getCleanOutputFromLiveResults();
+      if (!output) {
+        alert('هیچ کانفیگ سالمی برای ذخیره وجود ندارد.');
         return;
       }
       const targetFile = lastTestedFile || document.getElementById('fileSelect').value;
       if (!targetFile) {
         const manualName = prompt('نام فایلی که می‌خواهید درون profiles ذخیره شود را وارد کنید (مثال: mynodes.txt):');
         if (!manualName) return;
-        return doSaveFile(manualName.trim(), lastCleanOutput);
+        return doSaveFile(manualName.trim(), output);
       }
 
       if (!confirm('آیا مطمئن هستید که می‌خواهید کانفیگ‌های سالم را مستقیماً روی فایل اصلی (' + targetFile + ') ذخیره کنید؟')) {
         return;
       }
-      await doSaveFile(targetFile, lastCleanOutput);
+      await doSaveFile(targetFile, output);
     }
 
     async function saveWithSuffixFile() {
-      if (!lastCleanOutput) {
-        alert('ابتدا تست را اجرا نمایید تا کانفیگ‌های سالم مشخص شوند.');
+      const output = getCleanOutputFromLiveResults();
+      if (!output) {
+        alert('هیچ کانفیگ سالمی برای ذخیره وجود ندارد.');
         return;
       }
       const targetFile = lastTestedFile || document.getElementById('fileSelect').value;
