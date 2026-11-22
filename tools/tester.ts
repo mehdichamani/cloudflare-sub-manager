@@ -453,12 +453,20 @@ async function testSingleSingboxOutbound(
   }
 }
 
+export type ProgressCallback = (progress: {
+  completed: number;
+  total: number;
+  lastResult: TestResult;
+  results: TestResult[];
+}) => void;
+
 /**
  * Run tests concurrently across all nodes (URIs)
  */
 export async function curateNodes(
   nodeUris: string[],
-  config: TesterConfig
+  config: TesterConfig,
+  onProgress?: ProgressCallback
 ): Promise<TestResult[]> {
   const results: TestResult[] = [];
   const basePort = 19100 + Math.floor(Math.random() * 500);
@@ -503,17 +511,36 @@ export async function curateNodes(
             process.stdout.write(
               `\r[${completed}/${nodeUris.length}] (${pct}%) ${statusIcon} Node #${idx + 1}: ${info.padEnd(25)}`
             );
+
+            if (onProgress) {
+              onProgress({
+                completed,
+                total: nodeUris.length,
+                lastResult: res,
+                results: [...results],
+              });
+            }
           })
           .catch((err) => {
-            results.push({
+            const failResult: TestResult = {
               raw: uri,
               originalRemark: '',
               protocol: 'unknown',
               alive: false,
               latencyMs: 9999,
               error: err.message,
-            });
+            };
+            results.push(failResult);
             completed++;
+
+            if (onProgress) {
+              onProgress({
+                completed,
+                total: nodeUris.length,
+                lastResult: failResult,
+                results: [...results],
+              });
+            }
           })
           .finally(() => {
             activeWorkers--;
@@ -531,7 +558,8 @@ export async function curateNodes(
  */
 export async function curateXrayJson(
   configObj: any,
-  config: TesterConfig
+  config: TesterConfig,
+  onProgress?: ProgressCallback
 ): Promise<{ results: TestResult[]; enhancedConfig: any }> {
   const proxyOutbounds = (configObj.outbounds || []).filter((o: any) =>
     ['vless', 'vmess', 'trojan', 'shadowsocks', 'socks'].includes(o.protocol)
@@ -566,6 +594,15 @@ export async function curateXrayJson(
     process.stdout.write(
       `\r[${completed}/${proxyOutbounds.length}] (${pct}%) ${statusIcon} Outbound #${i + 1}: ${info.padEnd(25)}`
     );
+
+    if (onProgress) {
+      onProgress({
+        completed,
+        total: proxyOutbounds.length,
+        lastResult: res,
+        results: [...results],
+      });
+    }
   }
 
   // Filter healthy outbounds and sort ascending by latency
@@ -609,7 +646,8 @@ export async function curateXrayJson(
  */
 export async function curateSingboxJson(
   configObj: any,
-  config: TesterConfig
+  config: TesterConfig,
+  onProgress?: ProgressCallback
 ): Promise<{ results: TestResult[]; enhancedConfig: any }> {
   const proxyOutbounds = (configObj.outbounds || []).filter((o: any) =>
     ['vless', 'vmess', 'trojan', 'shadowsocks', 'socks', 'hysteria2', 'tuic'].includes(o.type)
@@ -637,6 +675,15 @@ export async function curateSingboxJson(
     process.stdout.write(
       `\r[${completed}/${proxyOutbounds.length}] (${pct}%) ${statusIcon} Outbound #${i + 1}: ${info.padEnd(25)}`
     );
+
+    if (onProgress) {
+      onProgress({
+        completed,
+        total: proxyOutbounds.length,
+        lastResult: res,
+        results: [...results],
+      });
+    }
   }
 
   // Filter healthy outbounds and sort ascending by latency
