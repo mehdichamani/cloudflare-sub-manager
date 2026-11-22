@@ -198,16 +198,30 @@ function parseVless(body: string, tag: string): XrayOutbound {
   const sni = params.get('sni') || address;
   const path = params.get('path') || '/';
   const host = params.get('host') || '';
+  const fp = params.get('fp') || 'chrome';
+  const pbk = params.get('pbk') || '';
+  const sid = params.get('sid') || '';
+  const spx = params.get('spx') || '';
+  const flow = params.get('flow') || '';
 
   const streamSettings: any = {
     network: net,
     security: security,
   };
 
-  if (security === 'tls') {
+  if (security === 'reality') {
+    streamSettings.realitySettings = {
+      serverName: sni,
+      fingerprint: fp,
+      publicKey: pbk,
+      shortId: sid,
+      spiderX: spx,
+    };
+  } else if (security === 'tls') {
     streamSettings.tlsSettings = {
       serverName: sni,
       allowInsecure: false,
+      fingerprint: fp,
     };
   }
 
@@ -222,6 +236,14 @@ function parseVless(body: string, tag: string): XrayOutbound {
     };
   }
 
+  const user: any = {
+    id: uuid,
+    encryption: params.get('encryption') || 'none',
+  };
+  if (flow) {
+    user.flow = flow;
+  }
+
   return {
     protocol: 'vless',
     tag,
@@ -230,12 +252,7 @@ function parseVless(body: string, tag: string): XrayOutbound {
         {
           address,
           port,
-          users: [
-            {
-              id: uuid,
-              encryption: params.get('encryption') || 'none',
-            },
-          ],
+          users: [user],
         },
       ],
     },

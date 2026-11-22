@@ -117,11 +117,13 @@ async function main() {
       .sort((a, b) => a.latencyMs - b.latencyMs);
 
     const deadNodes = results.filter((r) => !r.alive);
+    const geminiSupported = aliveNodes.filter((r) => r.geminiOk);
 
     console.log(`\n📊 Summary for ${file}:`);
-    console.log(`  - Total nodes:    ${results.length}`);
-    console.log(`  - Alive & Fast:   ${aliveNodes.length} ✅`);
-    console.log(`  - Dead / Timeout: ${deadNodes.length} ❌`);
+    console.log(`  - Total nodes:       ${results.length}`);
+    console.log(`  - Alive & Fast:      ${aliveNodes.length} ✅`);
+    console.log(`  - Gemini Ready (🧠):  ${geminiSupported.length}`);
+    console.log(`  - Dead / Timeout:    ${deadNodes.length} ❌`);
 
     if (aliveNodes.length > 0) {
       const isChainMode = !!config.chainProxy;
@@ -132,7 +134,8 @@ async function main() {
         const cityOrCountry = node.geo?.city || node.geo?.countryName || '';
         const locationPart = cityOrCountry ? ` - ${cityOrCountry}` : '';
         const modeTag = isChainMode ? ' 🔗' : '';
-        const newRemark = `${flag} ${countryCode}${locationPart} | ${node.latencyMs}ms${modeTag} #${orderNum}`;
+        const geminiTag = node.geminiOk ? ' 🧠' : '';
+        const newRemark = `${flag} ${countryCode}${locationPart} | ${node.latencyMs}ms${modeTag} #${orderNum}${geminiTag}`;
         const baseWithoutHash = node.raw.split('#')[0];
         return `${baseWithoutHash}#${encodeURIComponent(newRemark)}`;
       });

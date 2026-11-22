@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
+import tls from 'node:tls';
 import { spawn, ChildProcess } from 'node:child_process';
 import { parseUriToOutbound } from './xray-converter.ts';
 import { countryCodeToEmoji, getCountryName, extractGeoFromRemark, type GeoLocation } from './geo.ts';
@@ -13,6 +14,7 @@ export interface TestResult {
   alive: boolean;
   latencyMs: number;
   geo?: GeoLocation;
+  geminiOk?: boolean;
   newRaw?: string;
   error?: string;
   tag?: string;
@@ -66,6 +68,86 @@ function testHttpViaProxy(
     });
 
     req.end();
+  });
+}
+
+/**
+ * Test HTTPS connection to Gemini via HTTP CONNECT proxy tunnel
+ */
+export function testGeminiViaProxy(
+  proxyPort: number,
+  timeoutMs: number = 4000
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const targetHost = 'gemini.google.com';
+    const connectReq = http.request({
+      host: '127.0.0.1',
+      port: proxyPort,
+      method: 'CONNECT',
+      path: `${targetHost}:443`,
+      timeout: timeoutMs,
+    });
+
+    let finished = false;
+    const done = (ok: boolean) => {
+      if (finished) return;
+      finished = true;
+      resolve(ok);
+    };
+
+    connectReq.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        done(false);
+        return;
+      }
+
+      const tlsSocket = tls.connect(
+        {
+          socket,
+          servername: targetHost,
+          rejectUnauthorized: false,
+          timeout: timeoutMs,
+        },
+        () => {
+          const reqStr = `GET / HTTP/1.1\r\nHost: ${targetHost}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nConnection: close\r\n\r\n`;
+          tlsSocket.write(reqStr);
+        }
+      );
+
+      let buffer = '';
+      tlsSocket.on('data', (chunk) => {
+        buffer += chunk.toString();
+        if (buffer.includes('\r\n\r\n')) {
+          const match = buffer.match(/^HTTP\/[0-9.]+\s+(\d+)/);
+          const statusCode = match ? parseInt(match[1], 10) : 0;
+          tlsSocket.destroy();
+          // Gemini returns 200 or 302/303 redirect if IP is allowed. Blocked IPs return 403.
+          done(statusCode >= 200 && statusCode < 400);
+        }
+      });
+
+      tlsSocket.on('error', () => {
+        tlsSocket.destroy();
+        done(false);
+      });
+
+      tlsSocket.on('timeout', () => {
+        tlsSocket.destroy();
+        done(false);
+      });
+    });
+
+    connectReq.on('timeout', () => {
+      connectReq.destroy();
+      done(false);
+    });
+
+    connectReq.on('error', () => {
+      done(false);
+    });
+
+    connectReq.end();
   });
 }
 
@@ -232,6 +314,8 @@ async function runOutboundTestWithXray(
       }
     }
 
+    const geminiOk = await testGeminiViaProxy(assignedPort, Math.min(config.timeoutMs, 4000));
+
     return {
       raw,
       originalRemark,
@@ -239,6 +323,7 @@ async function runOutboundTestWithXray(
       alive: true,
       latencyMs: probe.latencyMs,
       geo: geo || undefined,
+      geminiOk,
       tag: outbound.tag,
     };
   } catch (err: any) {
@@ -334,6 +419,8 @@ async function testSingleSingboxOutbound(
       if (deduced) geo = deduced;
     }
 
+    const geminiOk = await testGeminiViaProxy(assignedPort, Math.min(config.timeoutMs, 4000));
+
     return {
       raw,
       originalRemark,
@@ -341,6 +428,7 @@ async function testSingleSingboxOutbound(
       alive: true,
       latencyMs: probe.latencyMs,
       geo: geo || undefined,
+      geminiOk,
       tag: outbound.tag,
     };
   } catch (err: any) {
@@ -407,8 +495,9 @@ export async function curateNodes(
             completed++;
             const pct = Math.round((completed / nodeUris.length) * 100);
             const statusIcon = res.alive ? '✅' : '❌';
+            const geminiTag = res.geminiOk ? ' 🧠' : '';
             const info = res.alive
-              ? `${res.geo?.flagEmoji || '⚡'} ${res.latencyMs}ms (${res.geo?.countryCode || 'OK'})`
+              ? `${res.geo?.flagEmoji || '⚡'} ${res.latencyMs}ms (${res.geo?.countryCode || 'OK'})${geminiTag}`
               : 'DEAD';
 
             process.stdout.write(
@@ -469,8 +558,9 @@ export async function curateXrayJson(
     completed++;
     const pct = Math.round((completed / proxyOutbounds.length) * 100);
     const statusIcon = res.alive ? '✅' : '❌';
+    const geminiTag = res.geminiOk ? ' 🧠' : '';
     const info = res.alive
-      ? `${res.geo?.flagEmoji || '⚡'} ${res.latencyMs}ms (${res.geo?.countryCode || 'OK'})`
+      ? `${res.geo?.flagEmoji || '⚡'} ${res.latencyMs}ms (${res.geo?.countryCode || 'OK'})${geminiTag}`
       : 'DEAD';
 
     process.stdout.write(
@@ -495,7 +585,8 @@ export async function curateXrayJson(
     const flag = res.geo?.flagEmoji || '🌐';
     const countryCode = res.geo?.countryCode && res.geo.countryCode !== 'XX' ? res.geo.countryCode : 'Proxy';
     const city = res.geo?.city ? ` - ${res.geo.city}` : '';
-    const newTag = `${flag} ${countryCode}${city} | ${res.latencyMs}ms #${orderNum}`;
+    const geminiTag = res.geminiOk ? ' 🧠' : '';
+    const newTag = `${flag} ${countryCode}${city} | ${res.latencyMs}ms #${orderNum}${geminiTag}`;
     cloned.tag = newTag;
     newOutbounds.push(cloned);
   });
@@ -538,8 +629,9 @@ export async function curateSingboxJson(
     completed++;
     const pct = Math.round((completed / proxyOutbounds.length) * 100);
     const statusIcon = res.alive ? '✅' : '❌';
+    const geminiTag = res.geminiOk ? ' 🧠' : '';
     const info = res.alive
-      ? `${res.geo?.flagEmoji || '⚡'} ${res.latencyMs}ms (${res.geo?.countryCode || 'OK'})`
+      ? `${res.geo?.flagEmoji || '⚡'} ${res.latencyMs}ms (${res.geo?.countryCode || 'OK'})${geminiTag}`
       : 'DEAD';
 
     process.stdout.write(
@@ -563,7 +655,8 @@ export async function curateSingboxJson(
     const flag = res.geo?.flagEmoji || '🌐';
     const countryCode = res.geo?.countryCode && res.geo.countryCode !== 'XX' ? res.geo.countryCode : 'Proxy';
     const city = res.geo?.city ? ` - ${res.geo.city}` : '';
-    const newTag = `${flag} ${countryCode}${city} | ${res.latencyMs}ms #${orderNum}`;
+    const geminiTag = res.geminiOk ? ' 🧠' : '';
+    const newTag = `${flag} ${countryCode}${city} | ${res.latencyMs}ms #${orderNum}${geminiTag}`;
     tagMap.set(orig.tag, newTag);
     cloned.tag = newTag;
     newProxyOutbounds.push(cloned);
