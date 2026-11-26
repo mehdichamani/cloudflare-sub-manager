@@ -328,7 +328,7 @@ const server = http.createServer(async (req, res) => {
         // Put secret to Cloudflare via wrangler secret put
         const pnpmCmd = 'pnpm';
         const args = ['exec', 'wrangler', 'secret', 'put', 'SUB_SECRET', '--env-file', ENV_FILE];
-        const child = spawn(pnpmCmd, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+        const child = spawn(pnpmCmd, args, { stdio: ['pipe', 'pipe', 'pipe'], env: getWranglerEnv() });
 
         let output = '';
         child.stdout.on('data', (d) => (output += d));
@@ -395,10 +395,22 @@ const server = http.createServer(async (req, res) => {
   res.end('Not Found');
 });
 
+function getWranglerEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  const proxyKeys = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'];
+  for (const key of proxyKeys) {
+    const val = env[key];
+    if (val && !/^https?:\/\//i.test(val.trim())) {
+      delete env[key];
+    }
+  }
+  return env;
+}
+
 function runWranglerCommand(wranglerArgs: string[], res: http.ServerResponse, prefixOutput: string = '') {
   const pnpmCmd = 'pnpm';
   const args = ['exec', 'wrangler', ...wranglerArgs, '--env-file', ENV_FILE];
-  const child = spawn(pnpmCmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(pnpmCmd, args, { stdio: ['ignore', 'pipe', 'pipe'], env: getWranglerEnv() });
 
   let output = prefixOutput ? `${prefixOutput}\n` : '';
   child.stdout.on('data', (d) => (output += d));
